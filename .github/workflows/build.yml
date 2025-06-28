@@ -16,9 +16,12 @@ jobs:
       - run: pip install -r requirements.txt
       - run: python build_sietsemap.py
       - name: Commit & push if map changed
+        env:
+          PAT: ${{ secrets.PAT }}
         run: |
           git config user.name  "sietsemap-bot"
           git config user.email "bot@example.com"
+          git remote set-url origin https://x-access-token:${PAT}@github.com/${{ github.repository }}
           if [ -n "$(git status --porcelain)" ]; then
             git add .
             git commit -m "update map $(date -u +"%Y-%m-%d")"
