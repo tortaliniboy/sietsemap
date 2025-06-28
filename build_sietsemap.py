@@ -1,53 +1,72 @@
-"""
-Builds an interactive HTML map (“Sietsemap”) of every NYC restaurant
-mentioned in Robert Sietsema’s Substack posts.
-
-• Scrapes the RSS feed  →  pulls newest posts
-• Heuristically extracts {name, address, blurb}
-• Geocodes each address  →  latitude / longitude
-• Builds a Folium map     →  public/index.html
-"""
-
-import re, os, json, datetime, html, time, feedparser
+import re
+import html
+import time
+import json
+import feedparser
+import folium
+import traceback
+import io
 from pathlib import Path
 from bs4 import BeautifulSoup
-import folium
 from geopy.geocoders import Nominatim
+import spacy
 
-RSS_URL        = "https://robertsietsema.substack.com/feed"
-CACHE_FILE     = Path("restaurants.json")           # stores all seen spots
-OUTPUT_HTML    = Path("public/index.html")
-USER_AGENT     = "sietsemap-bot/0.1 (github action)"
+# Load spaCy English model (make sure to install as above)
+nlp = spacy.load("en_core_web_sm")
 
-# ---------- helpers ---------------------------------------------------------
+RSS_URL = "https://robertsietsema.substack.com/feed"
+CACHE_FILE = Path("restaurants.json")
+OUTPUT_HTML = Path("public/index.html")
+USER_AGENT = "sietsemap-bot/0.1 (github action)"
+
+# Multiple regex patterns for flexible address extraction
+ADDRESS_PATTERNS = [
+    re.compile(r"\d{1,5}[A-Z]?\s+[\w\s.,'&/-]+,\s*(Brooklyn|Bronx|Queens|Manhattan|Staten Island|New York|NYC)[^,]*\d{5}", re.I),
+    re.compile(r"\d{1,5}[A-Z]?\s+[\w\s.,'&/-]+,\s*(Brooklyn|Bronx|Queens|Manhattan|Staten Island|New York|NYC)", re.I),
+    re.compile(r"[\w\s.'/-]+&[\w\s.'/-]+,\s*(Brooklyn|Bronx|Queens|Manhattan|Staten Island|New York|NYC)", re.I),
+    re.compile(r"\d{1,5}[A-Z]?\s+[\w\s.,'&/-]+", re.I),
+]
+
 def fetch_feed():
     return feedparser.parse(RSS_URL)
 
 def pull_posts(feed):
     for entry in feed.entries:
         yield {
-            "title":   entry.get("title", "Untitled"),
-            "date":    entry.get("published", ""),
+            "title": entry.get("title", "Untitled"),
+            "date": entry.get("published", ""),
             "content": entry.get("content", [{}])[0].get("value", "")
         }
 
-ADDRESS_RX = re.compile(
-    r"\b(\d{1,5}[A-Z]?\s+[\w\s.,'&/-]+?,\s*(?:Brooklyn|Bronx|Queens|Manhattan|"
-    r"Staten Island|New York|NYC)[\w\s.,'-]*?(?:NY)?\s*\d{5})",
-    re.I)
-
-def extract_restaurants(post):
+def extract_restaurants_flexible(post):
     soup = BeautifulSoup(post["content"], "html.parser")
     text = soup.get_text("\n")
     found = []
-    for match in ADDRESS_RX.finditer(text):
-        address = html.unescape(match.group(1)).strip()
-        # crude name = line just above the address
-        before   = text[:match.start()].splitlines()
-        name_line= before[-1].strip() if before else "Unnamed"
-        blurb    = "…".join(text[match.start(): match.end()+140].splitlines())[:260]
-        found.append({"name": name_line, "address": address, "blurb": blurb})
-    return found
+
+    # Regex extraction
+    for pattern in ADDRESS_PATTERNS:
+        for match in pattern.finditer(text):
+            address = match.group().strip()
+            before = text[:match.start()].splitlines()
+            name_line = before[-1].strip() if before else "Unnamed"
+            blurb = "…".join(text[match.start(): match.end()+140].splitlines())[:260]
+            found.append({"name": name_line, "address": address, "blurb": blurb})
+
+    # spaCy NER fallback
+    doc = nlp(text)
+    for ent in doc.ents:
+        if ent.label_ in ("ORG", "FAC", "GPE", "LOC"):
+            if re.search(r'\d{1,5}', ent.text) or any(b in ent.text for b in ["Brooklyn","Bronx","Queens","Manhattan","Staten Island","New York","NYC"]):
+                found.append({"name": ent.text, "address": ent.text, "blurb": ""})
+
+    # Remove duplicates by address
+    seen = set()
+    unique = []
+    for r in found:
+        if r["address"] not in seen:
+            unique.append(r)
+            seen.add(r["address"])
+    return unique
 
 def load_cache():
     if CACHE_FILE.exists():
@@ -68,32 +87,41 @@ def geocode(addr, geocoder):
         pass
     return None
 
-# ---------- main workflow ---------------------------------------------------
 def main():
     geocoder = Nominatim(user_agent=USER_AGENT)
-    known    = load_cache()
+    known = load_cache()
     seen_addrs = {r["address"] for r in known}
 
-    # 1. scrape new posts
-    for post in pull_posts(fetch_feed()):
-        for r in extract_restaurants(post):
-            if r["address"] in seen_addrs:           # already stored
+    feed = fetch_feed()
+    new_found = 0
+
+    for post in pull_posts(feed):
+        try:
+            extracted = extract_restaurants_flexible(post)
+        except Exception:
+            print(f"Error extracting restaurants from post: {post['title']}")
+            traceback.print_exc()
+            continue
+
+        for r in extracted:
+            if r["address"] in seen_addrs:
                 continue
             coords = geocode(r["address"], geocoder)
             if not coords:
-                continue                             # skip if geocoding fails
+                continue
             r["lat"], r["lon"] = coords
-            r["date_added"]   = datetime.date.today().isoformat()
+            r["date_added"] = post["date"] or ""
             known.append(r)
             seen_addrs.add(r["address"])
-            time.sleep(1)                            # gentle on Nominatim
+            new_found += 1
+            time.sleep(1)  # be gentle on geocoder
 
-    # 2. save updated cache
+    print(f"Found {new_found} new restaurants.")
+
     save_cache(known)
 
-    # 3. build map
-    m = folium.Map(location=[40.73, -73.94], zoom_start=11,
-                   tiles="CartoDB positron")
+    # Build map
+    m = folium.Map(location=[40.73, -73.94], zoom_start=11, tiles="CartoDB positron")
 
     for r in known:
         popup_html = (
@@ -110,7 +138,7 @@ def main():
 
     OUTPUT_HTML.parent.mkdir(exist_ok=True)
     m.save(str(OUTPUT_HTML))
-    print(f"Map rebuilt ➜ {OUTPUT_HTML}")
+    print(f"Map saved ➜ {OUTPUT_HTML}")
 
 if __name__ == "__main__":
     main()
