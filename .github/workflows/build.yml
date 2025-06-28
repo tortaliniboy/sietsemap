@@ -1,9 +1,9 @@
-name: Rebuild Sietsemap
+name: Build and Deploy Sietsemap
 
 on:
   schedule:
     - cron:  '0 10 * * *'     # every day at 10 UTC
-  workflow_dispatch:          # run manually from the Actions tab
+  workflow_dispatch:          # allows manual triggering
 
 jobs:
   build:
@@ -14,7 +14,10 @@ jobs:
         with:
           python-version: '3.12'
       - run: pip install -r requirements.txt
+      - run: python -m spacy download en_core_web_sm
       - run: python build_sietsemap.py
+
+      # Commit and push changes if map updated
       - name: Commit & push if map changed
         env:
           PAT: ${{ secrets.PAT }}
@@ -27,3 +30,10 @@ jobs:
             git commit -m "update map $(date -u +"%Y-%m-%d")"
             git push
           fi
+
+      # (Optional) Trigger a Render deploy via deploy hook
+      # - name: Trigger Render Deploy
+      #   env:
+      #     RENDER_DEPLOY_HOOK_URL: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
+      #   run: |
+      #     curl -X POST $RENDER_DEPLOY_HOOK_URL
